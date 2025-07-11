@@ -20,7 +20,7 @@ to perform generation.
 
 import contextlib
 import numpy as np
-import random
+import re, random
 import torch
 import torch.distributed
 import ray
@@ -54,37 +54,234 @@ class HFShardedMTRollout(BaseRollout):
         # Maximum token length of each segment when splitting long queries
         self.segment_token_length = self.config.get("segment_token_length", 128)
 
-    def _split_question_into_segments(self, question: str):
+    def _sanity_check(self, dp: DataProto, pad_token_id: int, tokenizer):
         """
-        按句末标点切分 *question*，并去掉每段末尾多余的逗号/分号。
+        Validate the DataProto structure after generation.
+        Checks tensor shapes, padding consistency, and position_ids continuity.
         """
-        import re
+        td = dp.batch
+        ids = td["input_ids"]
+        attn = td["attention_mask"]
+        pos = td["position_ids"]
+        prm = td["prompts"]
+        rsp = td["responses"]
 
-        # 把 . 也放进捕获分组，才能在 re.split 结果中被单独取出
-        delimiter_pattern = r"([。！？!?；;:]|\.(?!\d))"
+        # Check tensor shape consistency
+        assert ids.shape == attn.shape == pos.shape, "shape mismatch among ids/attn/pos"
+
+        B, L = ids.shape
+
+        # Check attention_mask corresponds to pad_token
+        assert torch.all((ids == pad_token_id) == (attn == 0)), "pad-token and attention_mask mismatch"
+
+        # Check prompt/response alignment in input_ids
+        Lp = prm.size(1)
+        Lr = rsp.size(1)
+        assert Lp + Lr == L, "Lp+Lr != total length"
+        assert torch.equal(ids[:, :Lp], prm), "prompt slice mismatch"
+        assert torch.equal(ids[:, Lp:Lp+Lr], rsp), "response slice mismatch"
+
+        # Check position_ids continuity for each sample
+        for b in range(B):
+            sample_attn = attn[b]
+            sample_pos = pos[b]
+            
+            valid_mask = sample_attn == 1
+            valid_positions = torch.where(valid_mask)[0]
+            
+            if len(valid_positions) > 1:
+                valid_pos_ids = sample_pos[valid_positions]
+                diff = valid_pos_ids[1:] - valid_pos_ids[:-1]
+                
+                if not torch.all(diff == 1):
+                    print(f"Sample {b} position_ids discontinuous:")
+                    print(f"  Valid positions: {valid_positions.tolist()}")
+                    print(f"  Position_ids: {valid_pos_ids.tolist()}")
+                    print(f"  Differences: {diff.tolist()}")
+                    
+                assert torch.all(diff == 1), f"Sample {b} position_ids not continuous"
+
+        # Check response position_id continuity with prompt
+        for b in range(B):
+            prompt_valid = attn[b, :Lp] == 1
+            response_valid = attn[b, Lp:] == 1
+            
+            if prompt_valid.any() and response_valid.any():
+                last_prompt_pos = pos[b, :Lp][prompt_valid][-1]
+                first_response_pos = pos[b, Lp:][response_valid][0]
+                
+                assert first_response_pos == last_prompt_pos + 1, \
+                    f"Sample {b}: response start position_id({first_response_pos}) != prompt end({last_prompt_pos}) + 1"
+
+        # Verify decoded content consistency
+        decoded_prompt = tokenizer.batch_decode(prm, skip_special_tokens=True)
+        decoded_slice = tokenizer.batch_decode(ids[:, :Lp], skip_special_tokens=True)
+        assert decoded_prompt == decoded_slice, "Decoded prompt content mismatch"
+
+        # Check padding token consistency
+        pad_mask = attn == 0
+        pad_tokens = ids[pad_mask]
+        if pad_tokens.numel() > 0:
+            assert torch.all(pad_tokens == pad_token_id), \
+                f"Non-pad tokens found in padding positions: {torch.unique(pad_tokens).tolist()}"
+
+        # Check padding continuity for each sample
+        for b in range(B):
+            sample_attn = attn[b]
+            sample_ids = ids[b]
+            
+            valid_positions = torch.where(sample_attn == 1)[0]
+            
+            if len(valid_positions) > 0:
+                first_valid = valid_positions[0]
+                last_valid = valid_positions[-1]
+                
+                # Check left padding
+                if first_valid > 0:
+                    left_pad_tokens = sample_ids[:first_valid]
+                    assert torch.all(left_pad_tokens == pad_token_id), \
+                        f"Sample {b}: left padding contains non-pad tokens"
+                
+                # Check right padding
+                if last_valid < L - 1:
+                    right_pad_tokens = sample_ids[last_valid + 1:]
+                    assert torch.all(right_pad_tokens == pad_token_id), \
+                        f"Sample {b}: right padding contains non-pad tokens"
+                
+                # Check middle continuity
+                if last_valid > first_valid:
+                    middle_attn = sample_attn[first_valid:last_valid + 1]
+                    assert torch.all(middle_attn == 1), \
+                        f"Sample {b}: padding found in middle of valid tokens"
+            else:
+                # If no valid tokens, entire sequence should be padding
+                assert torch.all(sample_ids == pad_token_id), \
+                    f"Sample {b}: no valid tokens but contains non-pad tokens"
+
+        # Check response mask continuity: if 0 appears, all following should be 0
+        for b in range(B):
+            resp_mask = attn[b, Lp:]
+            if resp_mask.numel():
+                zero_positions = torch.where(resp_mask == 0)[0]
+                if len(zero_positions) > 0:
+                    first_zero = zero_positions[0]
+                    after_first_zero = resp_mask[first_zero:]
+                    assert torch.all(after_first_zero == 0), \
+                        f"Sample {b}: attention_mask has 1s after EOS"
+
+    def _validate_format_consistency(self, dp: DataProto, expected_response_length: int):
+        """Validate that returned DataProto format is consistent with standard HFRollout"""
+        td = dp.batch
+        
+        # Check required keys exist
+        required_keys = {"prompts", "responses", "input_ids", "attention_mask", "position_ids"}
+        actual_keys = set(td.keys())
+        assert required_keys.issubset(actual_keys), f"Missing required keys: {required_keys - actual_keys}"
+        
+        # Check dimensions
+        batch_size = td.batch_size[0]
+        prompts = td["prompts"]
+        responses = td["responses"] 
+        input_ids = td["input_ids"]
+        attention_mask = td["attention_mask"]
+        position_ids = td["position_ids"]
+        
+        prompt_length = prompts.size(1)
+        response_length = responses.size(1)
+        total_length = input_ids.size(1)
+        
+        # Validate shape consistency
+        assert prompts.shape == (batch_size, prompt_length), f"prompts shape error: {prompts.shape}"
+        assert responses.shape == (batch_size, response_length), f"responses shape error: {responses.shape}"
+        assert input_ids.shape == (batch_size, total_length), f"input_ids shape error: {input_ids.shape}"
+        assert attention_mask.shape == (batch_size, total_length), f"attention_mask shape error: {attention_mask.shape}"
+        assert position_ids.shape == (batch_size, total_length), f"position_ids shape error: {position_ids.shape}"
+        
+        # Validate length relationships
+        assert prompt_length + response_length == total_length, "prompt + response != total length"
+        assert response_length == expected_response_length, f"response length {response_length} != expected {expected_response_length}"
+        
+        # Validate data type consistency
+        assert prompts.dtype == responses.dtype == input_ids.dtype, "token tensors have inconsistent types"
+        assert attention_mask.dtype == position_ids.dtype, "mask tensors have inconsistent types"
+        
+        # Validate tensor concatenation relationship
+        reconstructed = torch.cat([prompts, responses], dim=1)
+        assert torch.equal(input_ids, reconstructed), "input_ids != cat(prompts, responses)"
+
+    def _split_question_into_segments(self, question: str, *, shuffle: bool = False):
+        """
+        Split question into segments by sentence delimiters and remove trailing commas/semicolons.
+        If shuffle=True, randomly shuffle the order before returning.
+        """
+
+        delimiter_pattern = (
+            r"([。！？!?；;:]|"        # Full/half-width sentence endings
+            r"(?<!\d)[,，](?!\d)|"    # Commas, excluding digit separators
+            r"(?<!\d)\.(?!\d))"       # Periods, excluding decimals
+        )
+
         parts = re.split(delimiter_pattern, question)
-
         segments, buf = [], ""
+
         for frag in parts:
             if not frag:
                 continue
-
-            # 如果是句末标点 → 输出一个 segment
             if re.match(delimiter_pattern, frag):
                 buf += frag
-                seg = re.sub(r"[，,；;]+$", "", buf.strip())  # 去尾逗号/分号
+                seg = re.sub(r"[，,；;]+$", "", buf.strip())  # Remove trailing commas/semicolons
                 if seg:
                     segments.append(seg)
                 buf = ""
             else:
                 buf += frag
 
-        # 处理最后残留
         if buf.strip():
             segments.append(re.sub(r"[，,；;]+$", "", buf.strip()))
 
+        if shuffle:
+            random.shuffle(segments)
+
         return segments or [question]
 
+    def _split_question_into_n_segments(self, question: str, n: int):
+        """
+        Randomly select n-1 sentence boundary cut points to split question into exactly n segments.
+        
+        Uses same delimiters as _split_question_into_segments.
+        If available cut points < n-1, falls back to _split_question_into_segments result
+        and adjusts to ensure n segments.
+        """
+
+        delimiter_pattern = (
+            r"([。！？!?；;:]|"        # Sentence endings
+            r"(?<!\d)[,，](?!\d)|"    # Commas excluding digit grouping
+            r"(?<!\d)\.(?!\d))"       # Periods excluding decimals
+        )
+
+        # Collect valid cut points (after punctuation), excluding text end to avoid empty segments
+        cut_positions = [
+            m.end() for m in re.finditer(delimiter_pattern, question)
+            if m.end() < len(question)
+        ]
+
+        # Fallback if insufficient cut points or n<=1
+        if len(cut_positions) < n - 1 or n <= 1:
+            base = self._split_question_into_segments(question)
+            return (base[:n] + [""] * max(0, n - len(base)))[:n]
+
+        # Select n-1 cut points and sort
+        chosen = sorted(random.sample(cut_positions, n - 1))
+
+        # Generate segments, removing trailing commas/semicolons
+        segments, prev = [], 0
+        for cut in chosen + [len(question)]:
+            seg = question[prev:cut].strip()
+            seg = re.sub(r"[，,；;]+$", "", seg)
+            segments.append(seg)
+            prev = cut
+
+        return segments
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
@@ -100,8 +297,7 @@ class HFShardedMTRollout(BaseRollout):
 
         For each sample, we split the original user question into segments and run
         inference turn-by-turn, accumulating assistant responses, then return the
-        result built from the **last** turn (so RLHF can calculate reward on the
-        final answer).
+        result built from the last turn for RLHF reward calculation.
         """
         self.module.eval()
         # param_ctx will be created fresh for each generate call to avoid reusing exhausted context
@@ -149,164 +345,174 @@ class HFShardedMTRollout(BaseRollout):
             pad_token_id = prompts.meta_info["pad_token_id"]
 
             raw_prompts = prompts.non_tensor_batch["raw_prompt"]
-            sample_outputs = []
 
-            for idx_sample, chat in enumerate(raw_prompts):
-                if isinstance(chat, np.ndarray):
-                    chat = chat.tolist()
+            # Determine minimum number of segments across all samples
+            min_num_segments = 1  # fallback
+            num_segments_per_sample = []
+            segments_per_sample = []
+            for chat in raw_prompts:
+                # convert ndarray to list when necessary
+                chat_list = chat.tolist() if isinstance(chat, np.ndarray) else chat
 
-                # Identify the *last* user message as the target to split. Previous turns remain intact.
-                last_user_idx = max(i for i, m in enumerate(chat) if m["role"] == "user")
-                # Everything before that (inclusive previous assistant/tool/system messages) forms the running context.
-                conversation = chat[:last_user_idx]  # shallow copy is fine (list of dicts)
-                user_question = chat[last_user_idx]["content"]
-                user_question = user_question.split('Let\'s think step by step and output the final answer after')[0]
-                # segments = [user_question]
+                # locate last user message within the conversation
+                last_user_idx = max(i for i, m in enumerate(chat_list) if m["role"] == "user")
+                user_question = chat_list[last_user_idx]["content"]
+                segments_tmp = self._split_question_into_segments(user_question)
+                segments_per_sample.append(segments_tmp)
+                num_segments_per_sample.append(len(segments_tmp))
 
-                segments = self._split_question_into_segments(user_question)
-                random.shuffle(segments)
+            if num_segments_per_sample:
+                min_num_segments = max(1, min(num_segments_per_sample))
 
-                last_prompt_ids = None  # will store tensor for last turn
-                last_attention_mask = None
-                last_position_ids = None
-                last_seq = None
+            self.tokenizer.padding_side = "left"  # left pad for efficiency on causal LM
+
+            device = torch.device(get_device_name())
+            num_samples = len(raw_prompts)
+
+            # Build conversations & segments list for each sample
+            conversations = []  # list[list[dict]]
+            segments_all = []   # list[list[str]]
+            for chat in raw_prompts:
+                chat_l = chat.tolist() if isinstance(chat, np.ndarray) else chat
+                last_user_idx = max(i for i, m in enumerate(chat_l) if m["role"] == "user")
+                conversations.append(chat_l[:last_user_idx])
+                user_q = chat_l[last_user_idx]["content"]
+                segments_n = self._split_question_into_n_segments(user_q, min_num_segments)
+                random.shuffle(segments_n)
+                segments_all.append(segments_n)
+
+            # ray.util.pdb.set_trace()
+            # placeholders for last turn tensors
+            last_prompt_ids_lst, last_attention_mask_lst, last_position_ids_lst, last_seq_lst = [None]*num_samples, [None]*num_samples, [None]*num_samples, [None]*num_samples
+
+            for t in range(min_num_segments):
+                # Build prompts for this turn
+                prompt_texts = []
+                for s in range(num_samples):
+                    conversations[s].append({"role": "user", "content": segments_all[s][t]})
+                    if 'Qwen3' in self.module.config.name_or_path:
+                        pt = self.tokenizer.apply_chat_template(
+                            conversations[s], 
+                            tokenize=False, 
+                            add_generation_prompt=True, 
+                            enable_thinking=False)
+                    else:
+                        pt = self.tokenizer.apply_chat_template(
+                            conversations[s], 
+                            tokenize=False, add_generation_prompt=True)
+                    prompt_texts.append(pt)
+
+                tok_batch = self.tokenizer(prompt_texts, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
+                input_ids, attention_mask = tok_batch["input_ids"], tok_batch["attention_mask"]
+                position_ids_batch = compute_position_id_with_mask(attention_mask)
 
                 # ray.util.pdb.set_trace()
-                for seg in segments:
-                    # 1) append user seg to conversation
-                    conversation.append({"role": "user", "content": seg})
-
-                    # 2) tokenize current conversation
-                    if 'Qwen3' in self.module.config.name_or_path:
-                        prompt_text = self.tokenizer.apply_chat_template(
-                            conversation,
-                            tokenize=False,
-                            add_generation_prompt=True,
-                            enable_thinking=False 
-                        )
-                    else:
-                        prompt_text = self.tokenizer.apply_chat_template(
-                            conversation,
-                            add_generation_prompt=True,
-                            tokenize=False,
-                        )
-                    tok = self.tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
-                    device = torch.device(get_device_name())
-                    input_ids = tok["input_ids"].to(device)
-                    attention_mask = tok["attention_mask"].to(device)
-                    position_ids_current = compute_position_id_with_mask(attention_mask).to(device)
-
-                    ctx = (
-                        FSDP.summon_full_params(self.module, writeback=False, recurse=False)
-                        if isinstance(self.module, FSDP)
-                        else contextlib.nullcontext()
+                ctx = (FSDP.summon_full_params(self.module, writeback=False, recurse=False) if isinstance(self.module, FSDP) else contextlib.nullcontext())
+                with ctx, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+                    out = self.module.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        do_sample=do_sample,
+                        max_new_tokens=response_length,
+                        eos_token_id=eos_token_id,
+                        pad_token_id=pad_token_id,
+                        generation_config=generation_config,
+                        output_scores=False,
+                        return_dict_in_generate=True,
+                        use_cache=True,
                     )
 
-                    with ctx, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                        output = self.module.generate(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            do_sample=do_sample,
-                            max_new_tokens=response_length,
-                            eos_token_id=eos_token_id,
-                            pad_token_id=pad_token_id,
-                            generation_config=generation_config,
-                            output_scores=False,
-                            return_dict_in_generate=True,
-                            use_cache=True,
-                        )
-                    seq = output.sequences  # (1, prompt_len + new_tokens)
+                seq_batch = out.sequences  # (batch, prompt+new)
 
-                    # 3) decode assistant response and append as assistant message for next round (except after last seg)
-                    prompt_len = input_ids.size(1)
-                    assistant_text_all = self.tokenizer.decode(seq[0], skip_special_tokens=True)
-                    assistant_tokens = seq[0, prompt_len:]
-                    assistant_text = self.tokenizer.decode(assistant_tokens, skip_special_tokens=True)
-                    conversation.append({"role": "assistant", "content": assistant_text})
-                    # ray.util.pdb.set_trace()
+                # decode assistant text & update conversations
+                prompt_len_const = input_ids.size(1)  # original prompt length (after left padding) is same across batch
+                assistant_text_list = []
+                for s in range(num_samples):
+                    gen_tokens = seq_batch[s, prompt_len_const:]
+                    assistant_text = self.tokenizer.decode(gen_tokens, skip_special_tokens=True)
+                    conversations[s].append({"role": "assistant", "content": assistant_text})
+                    assistant_text_list.append(assistant_text)
+                    
+                if t == min_num_segments - 1:
+                    for s in range(num_samples):
+                        last_prompt_ids_lst[s] = input_ids[s:s+1].clone()
+                        last_attention_mask_lst[s] = attention_mask[s:s+1].clone()
+                        last_position_ids_lst[s] = position_ids_batch[s:s+1].clone()
+                        last_seq_lst[s] = seq_batch[s:s+1].clone()
+                # ray.util.pdb.set_trace()
 
-                    # Save tensors from this last turn (will be used to build output after loop)
-                    last_prompt_ids = input_ids
-                    last_attention_mask = attention_mask
-                    last_position_ids = position_ids_current
-                    last_seq = seq
+            # Build & left-pad outputs in a single pass
+            seq_lengths = []
+            adjusted_seq_list = []
+            prompt_len_list = []
 
-                # Build tensors for last turn similar to single-shot rollout logic
-                seq = last_seq  # (1, total_len)
-                prompt_length = last_prompt_ids.size(1)
-                generated_batch_size = 1
+            for s in range(num_samples):
+                seq = last_seq_lst[s]
+                prompt_len = last_prompt_ids_lst[s].size(1)
+                target_len = prompt_len + self.config.response_length
+                if seq.size(1) < target_len:
+                    pad_len = target_len - seq.size(1)
+                    seq = torch.cat([
+                        seq,
+                        torch.full((1, pad_len), pad_token_id, dtype=seq.dtype, device=seq.device),
+                    ], dim=1)
+                adjusted_seq_list.append(seq)
+                seq_lengths.append(seq.size(1))
+                prompt_len_list.append(prompt_len)
 
-                # pad response to fixed length
-                sequence_length = prompt_length + self.config.response_length
-                delta_length = sequence_length - seq.shape[1]
-                if delta_length > 0:
-                    delta_tokens = torch.full((generated_batch_size, delta_length), pad_token_id, dtype=seq.dtype, device=seq.device)
-                    seq = torch.cat((seq, delta_tokens), dim=1)
+            max_total_seq_len = max(seq_lengths)
 
-                response = seq[:, prompt_length:]
+            sample_outputs = []
+            for s in range(num_samples):
+                seq = adjusted_seq_list[s]
+                prompt_len = prompt_len_list[s]
+                if seq.size(1) < max_total_seq_len:
+                    pad_size = max_total_seq_len - seq.size(1)
+                    seq = torch.cat([
+                        torch.full((1, pad_size), pad_token_id, dtype=seq.dtype, device=seq.device),
+                        seq,
+                    ], dim=1)
 
-                # extend position_ids and attention_mask to response part
-                response_length_cur = response.size(1)
-                delta_position_id = torch.arange(1, response_length_cur + 1, device=last_position_ids.device)
-                response_position_ids = last_position_ids[:, -1:] + delta_position_id.unsqueeze(0)
-                position_ids_full = torch.cat([last_position_ids, response_position_ids], dim=-1)
+                    prompt_len_list[s] += pad_size
+                    last_prompt_ids_lst[s] = torch.cat(
+                        [torch.full((1, pad_size), pad_token_id, device=seq.device, dtype=seq.dtype),
+                        last_prompt_ids_lst[s]],
+                        dim=1)
+                        
+                    # attention_mask and position_ids need left-pad accordingly
+                    last_attention_mask_lst[s] = torch.cat([
+                        torch.zeros((1, pad_size), dtype=last_attention_mask_lst[s].dtype, device=seq.device),
+                        last_attention_mask_lst[s],
+                    ], dim=1)
+                    last_position_ids_lst[s] = torch.cat([
+                        torch.zeros((1, pad_size), dtype=last_position_ids_lst[s].dtype, device=seq.device),
+                        last_position_ids_lst[s],
+                    ], dim=1)
 
-                response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=last_attention_mask.dtype)
-                attention_mask_full = torch.cat((last_attention_mask, response_attention_mask), dim=-1)
+                response = seq[:, prompt_len:]
+                resp_attn_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=last_attention_mask_lst[s].dtype)
+                attn_mask_full = torch.cat([last_attention_mask_lst[s], resp_attn_mask], dim=-1)
 
-                prompts_ = seq[:, :prompt_length]
-                batch_td = TensorDict(
+                # Recompute position_ids from final attention_mask to guarantee monotonicity
+                pos_ids_full = compute_position_id_with_mask(attn_mask_full)
+
+                prompts_slice = seq[:, :prompt_len]
+                td = TensorDict(
                     {
-                        "prompts": prompts_,
+                        "prompts": prompts_slice,
                         "responses": response,
                         "input_ids": seq,
-                        "attention_mask": attention_mask_full,
-                        "position_ids": position_ids_full,
+                        "attention_mask": attn_mask_full,
+                        "position_ids": pos_ids_full,
                     },
-                    batch_size=generated_batch_size,
+                    batch_size=1,
                 )
-                sample_outputs.append(DataProto(batch=batch_td))
+                sample_outputs.append(DataProto(batch=td))
 
-            # Calculate target length (prompt_max + response_len)
-            max_total_seq_len = 0
-            for dp in sample_outputs:
-                max_total_seq_len = max(max_total_seq_len, dp.batch["input_ids"].shape[1])
-
-            if max_total_seq_len > 0:
-                padded_outputs = []
-                for dp in sample_outputs:
-                    td = dp.batch
-
-                    cur_len = td["input_ids"].shape[1]
-                    if cur_len < max_total_seq_len:
-                        # pad input_ids / attention_mask / position_ids on the **left**
-                        pad_size = max_total_seq_len
-
-                        input_ids = pad_sequence_to_length(td["input_ids"], pad_size, pad_token_id, left_pad=True)
-                        attention_mask = pad_sequence_to_length(td["attention_mask"], pad_size, 0, left_pad=True)
-                        position_ids = pad_sequence_to_length(td["position_ids"], pad_size, 0, left_pad=True)
-
-                        # regenerate prompts slice because prompt length expanded
-                        prompt_len_new = pad_size - self.config.response_length
-                        prompts_new = input_ids[:, :prompt_len_new]
-
-                        # rebuild TensorDict (responses keep the same fixed length)
-                        td = TensorDict(
-                            {
-                                "prompts": prompts_new,
-                                "responses": td["responses"],
-                                "input_ids": input_ids,
-                                "attention_mask": attention_mask,
-                                "position_ids": position_ids,
-                            },
-                            batch_size=td.batch_size,
-                        )
-                    # else keep original td
-                    padded_outputs.append(DataProto(batch=td))
-
-                sample_outputs = padded_outputs
-
-        # ray.util.pdb.set_trace()
+        ray.util.pdb.set_trace()
         self.module.train()
         get_torch_device().empty_cache()
-        return DataProto.concat(sample_outputs)
+        batch_data_proto = DataProto.concat(sample_outputs)
+        # self._validate_format_consistency(batch_data_proto, self.config.response_length)
+        # self._sanity_check(batch_data_proto, pad_token_id, self.tokenizer)
+        return batch_data_proto
