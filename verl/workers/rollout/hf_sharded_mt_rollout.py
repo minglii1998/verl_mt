@@ -92,12 +92,6 @@ class HFShardedMTRollout(BaseRollout):
             if len(valid_positions) > 1:
                 valid_pos_ids = sample_pos[valid_positions]
                 diff = valid_pos_ids[1:] - valid_pos_ids[:-1]
-                
-                if not torch.all(diff == 1):
-                    print(f"Sample {b} position_ids discontinuous:")
-                    print(f"  Valid positions: {valid_positions.tolist()}")
-                    print(f"  Position_ids: {valid_pos_ids.tolist()}")
-                    print(f"  Differences: {diff.tolist()}")
                     
                 assert torch.all(diff == 1), f"Sample {b} position_ids not continuous"
 
@@ -267,8 +261,7 @@ class HFShardedMTRollout(BaseRollout):
 
         # Fallback if insufficient cut points or n<=1
         if len(cut_positions) < n - 1 or n <= 1:
-            base = self._split_question_into_segments(question)
-            return (base[:n] + [""] * max(0, n - len(base)))[:n]
+            return [question]
 
         # Select n-1 cut points and sort
         chosen = sorted(random.sample(cut_positions, n - 1))
@@ -334,7 +327,7 @@ class HFShardedMTRollout(BaseRollout):
                     "top_p": top_p,
                     "top_k": top_k,
                     "temperature": temperature,
-                    "num_return_sequences": self.config.n,
+                    "num_return_sequences": 1, # not diretly use num_return_sequences for n rollouts
                 }
 
             # make config according to generate mode
@@ -362,29 +355,45 @@ class HFShardedMTRollout(BaseRollout):
                 num_segments_per_sample.append(len(segments_tmp))
 
             if num_segments_per_sample:
-                min_num_segments = max(1, min(num_segments_per_sample))
+                local_min_seg = max(1, min(num_segments_per_sample))
+
+            # ray.util.pdb.set_trace()
+            device = torch.device(get_device_name())
+            if torch.distributed.is_initialized():
+                min_seg_tensor = torch.tensor(local_min_seg, device=device, dtype=torch.long)
+                torch.distributed.all_reduce(min_seg_tensor, op=torch.distributed.ReduceOp.MIN)
+                min_num_segments = int(min_seg_tensor.item())
+            else:
+                min_num_segments = local_min_seg
+
+            # print(f"min_num_segments: {min_num_segments}", flush=True)
 
             self.tokenizer.padding_side = "left"  # left pad for efficiency on causal LM
 
-            device = torch.device(get_device_name())
-            num_samples = len(raw_prompts)
+            if is_validate:
+                config_n = 1
+            else:
+                config_n = self.config.n
+            num_samples = len(raw_prompts) * config_n
 
             # Build conversations & segments list for each sample
             conversations = []  # list[list[dict]]
             segments_all = []   # list[list[str]]
             for chat in raw_prompts:
-                chat_l = chat.tolist() if isinstance(chat, np.ndarray) else chat
-                last_user_idx = max(i for i, m in enumerate(chat_l) if m["role"] == "user")
-                conversations.append(chat_l[:last_user_idx])
-                user_q = chat_l[last_user_idx]["content"]
-                segments_n = self._split_question_into_n_segments(user_q, min_num_segments)
-                random.shuffle(segments_n)
-                segments_all.append(segments_n)
+                for i in range(config_n): # n rollouts
+                    chat_l = chat.tolist() if isinstance(chat, np.ndarray) else chat
+                    last_user_idx = max(i for i, m in enumerate(chat_l) if m["role"] == "user")
+                    conversations.append(chat_l[:last_user_idx])
+                    user_q = chat_l[last_user_idx]["content"]
+                    segments_n = self._split_question_into_n_segments(user_q, min_num_segments)
+                    random.shuffle(segments_n)
+                    segments_all.append(segments_n)
+
+            assert num_samples == len(conversations) == len(segments_all), f"num_samples: {num_samples}, len(conversations): {len(conversations)}, len(segments_all): {len(segments_all)}"
 
             # ray.util.pdb.set_trace()
             # placeholders for last turn tensors
             last_prompt_ids_lst, last_attention_mask_lst, last_position_ids_lst, last_seq_lst = [None]*num_samples, [None]*num_samples, [None]*num_samples, [None]*num_samples
-
             for t in range(min_num_segments):
                 # Build prompts for this turn
                 prompt_texts = []
@@ -407,8 +416,10 @@ class HFShardedMTRollout(BaseRollout):
                 position_ids_batch = compute_position_id_with_mask(attention_mask)
 
                 # ray.util.pdb.set_trace()
-                ctx = (FSDP.summon_full_params(self.module, writeback=False, recurse=False) if isinstance(self.module, FSDP) else contextlib.nullcontext())
-                with ctx, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+                with (
+                    FSDP.summon_full_params(self.module, writeback=False, recurse=False)
+                    if isinstance(self.module, FSDP) else contextlib.nullcontext()
+                ), torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                     out = self.module.generate(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
@@ -422,6 +433,11 @@ class HFShardedMTRollout(BaseRollout):
                         use_cache=True,
                     )
 
+                # 立刻同步，保证所有 rank 完全跑完 un-shard
+                torch.cuda.synchronize()
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+
                 seq_batch = out.sequences  # (batch, prompt+new)
 
                 # decode assistant text & update conversations
@@ -432,6 +448,10 @@ class HFShardedMTRollout(BaseRollout):
                     assistant_text = self.tokenizer.decode(gen_tokens, skip_special_tokens=True)
                     conversations[s].append({"role": "assistant", "content": assistant_text})
                     assistant_text_list.append(assistant_text)
+
+                # if assistant_text_list:
+                #     max_text = max(assistant_text_list, key=len)
+                #     print(f"t={t}, seq_batch: {seq_batch.shape}, longest_assistant_text: {[max_text]}", flush=True)
                     
                 if t == min_num_segments - 1:
                     for s in range(num_samples):
@@ -460,14 +480,24 @@ class HFShardedMTRollout(BaseRollout):
                 seq_lengths.append(seq.size(1))
                 prompt_len_list.append(prompt_len)
 
-            max_total_seq_len = max(seq_lengths)
+            local_max_seq_len = max(seq_lengths)
+            
+            # Synchronize global maximum sequence length across all distributed workers
+            # This ensures consistent tensor dimensions for DataProto.concat
+            global_max_seq_len = local_max_seq_len
+            if torch.distributed.is_initialized():
+                # Create tensor for all_reduce operation
+                max_len_tensor = torch.tensor(local_max_seq_len, dtype=torch.long, device=device)
+                # All-reduce to get the global maximum across all workers
+                torch.distributed.all_reduce(max_len_tensor, op=torch.distributed.ReduceOp.MAX)
+                global_max_seq_len = max_len_tensor.item()
 
             sample_outputs = []
             for s in range(num_samples):
                 seq = adjusted_seq_list[s]
                 prompt_len = prompt_len_list[s]
-                if seq.size(1) < max_total_seq_len:
-                    pad_size = max_total_seq_len - seq.size(1)
+                if seq.size(1) < global_max_seq_len:
+                    pad_size = global_max_seq_len - seq.size(1)
                     seq = torch.cat([
                         torch.full((1, pad_size), pad_token_id, dtype=seq.dtype, device=seq.device),
                         seq,
@@ -479,24 +509,23 @@ class HFShardedMTRollout(BaseRollout):
                         last_prompt_ids_lst[s]],
                         dim=1)
                         
-                    # attention_mask and position_ids need left-pad accordingly
+                    # For prompt attention_mask: only pad with zeros for the prompt part
                     last_attention_mask_lst[s] = torch.cat([
                         torch.zeros((1, pad_size), dtype=last_attention_mask_lst[s].dtype, device=seq.device),
                         last_attention_mask_lst[s],
                     ], dim=1)
-                    last_position_ids_lst[s] = torch.cat([
-                        torch.zeros((1, pad_size), dtype=last_position_ids_lst[s].dtype, device=seq.device),
-                        last_position_ids_lst[s],
-                    ], dim=1)
 
-                response = seq[:, prompt_len:]
+                    # For prompt position_ids: recompute from the padded prompt attention_mask
+                    last_position_ids_lst[s] = compute_position_id_with_mask(last_attention_mask_lst[s])
+
+                response = seq[:, prompt_len_list[s]:]
                 resp_attn_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=last_attention_mask_lst[s].dtype)
                 attn_mask_full = torch.cat([last_attention_mask_lst[s], resp_attn_mask], dim=-1)
 
                 # Recompute position_ids from final attention_mask to guarantee monotonicity
                 pos_ids_full = compute_position_id_with_mask(attn_mask_full)
 
-                prompts_slice = seq[:, :prompt_len]
+                prompts_slice = seq[:, :prompt_len_list[s]]
                 td = TensorDict(
                     {
                         "prompts": prompts_slice,
@@ -509,10 +538,10 @@ class HFShardedMTRollout(BaseRollout):
                 )
                 sample_outputs.append(DataProto(batch=td))
 
-        ray.util.pdb.set_trace()
         self.module.train()
         get_torch_device().empty_cache()
         batch_data_proto = DataProto.concat(sample_outputs)
-        # self._validate_format_consistency(batch_data_proto, self.config.response_length)
-        # self._sanity_check(batch_data_proto, pad_token_id, self.tokenizer)
+        self._validate_format_consistency(batch_data_proto, self.config.response_length)
+        self._sanity_check(batch_data_proto, pad_token_id, self.tokenizer)
+        # ray.util.pdb.set_trace()
         return batch_data_proto
