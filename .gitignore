@@ -124,3 +124,7 @@ logs
 log
 outputs
 .history
+
+*.json
+lic_sharded_to_parquet.py
+*.sh

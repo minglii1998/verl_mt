@@ -14,6 +14,7 @@
 
 from .base import BaseRollout
 from .hf_rollout import HFRollout
+from .hf_sharded_mt_rollout import HFShardedMTRollout
 from .naive import NaiveRollout
 
-__all__ = ["BaseRollout", "NaiveRollout", "HFRollout"]
+__all__ = ["BaseRollout", "NaiveRollout", "HFRollout", "HFShardedMTRollout"]

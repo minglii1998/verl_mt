@@ -19,8 +19,16 @@ from verl import DataProto
 
 
 class BaseShardingManager:
+    def __init__(self):
+        # `timing` is used by fsdp_workers to aggregate latency information
+        # Downstream code expects the sharding manager to always have this attribute.
+        # For simple HF rollout that does not really shard, we keep an empty dict.
+        self.timing: dict = {}
+
     def __enter__(self):
-        pass
+        # No special pre-processing for the default manager, but we still
+        # return `self` so that advanced usages like `with manager as m:` work.
+        return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         pass

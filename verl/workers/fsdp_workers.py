@@ -414,6 +414,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             rollout_sharding_manager = BaseShardingManager()
             # TODO: a sharding manager that do nothing?
 
+        elif rollout_name == "hf_sharded_mt":
+            from verl.workers.rollout import HFShardedMTRollout
+            from verl.workers.sharding_manager.base import BaseShardingManager
+
+            rollout = HFShardedMTRollout(module=self.actor_module_fsdp, config=self.config.rollout)
+            rollout_sharding_manager = BaseShardingManager()
+
         elif rollout_name == "vllm":
             from verl.workers.rollout.vllm_rollout import vllm_mode, vLLMRollout
             from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager

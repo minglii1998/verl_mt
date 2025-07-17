@@ -15,6 +15,7 @@
 from collections import defaultdict
 
 import torch
+import ray
 
 from verl import DataProto
 from verl.utils.reward_score import default_compute_score
@@ -76,6 +77,7 @@ class NaiveRewardManager:
             ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
             data_source = data_item.non_tensor_batch[self.reward_fn_key]
             extra_info = data_item.non_tensor_batch.get("extra_info", None)
+            extra_info["rollout_info"] = data_item.non_tensor_batch.get("rollout_info", None)
 
             score = self.compute_score(
                 data_source=data_source,

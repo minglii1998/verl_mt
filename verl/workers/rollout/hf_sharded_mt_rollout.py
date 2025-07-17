@@ -54,6 +54,9 @@ class HFShardedMTRollout(BaseRollout):
         # Maximum token length of each segment when splitting long queries
         self.segment_token_length = self.config.get("segment_token_length", 128)
 
+        self.input_abstain_rate = config.get("input_abstain_rate", 0.0)
+        self.abstain_prompt = "If you believe the question is not solvable, reason step by step and output \\boxed{abstain}."
+
     def _sanity_check(self, dp: DataProto, pad_token_id: int, tokenizer):
         """
         Validate the DataProto structure after generation.
@@ -379,14 +382,35 @@ class HFShardedMTRollout(BaseRollout):
             # Build conversations & segments list for each sample
             conversations = []  # list[list[dict]]
             segments_all = []   # list[list[str]]
-            for chat in raw_prompts:
+            required_reward_types = []
+            for j, chat in enumerate(raw_prompts):
                 for i in range(config_n): # n rollouts
                     chat_l = chat.tolist() if isinstance(chat, np.ndarray) else chat
                     last_user_idx = max(i for i, m in enumerate(chat_l) if m["role"] == "user")
-                    conversations.append(chat_l[:last_user_idx])
+
+                    conv = list(chat_l[:last_user_idx])
+                    if self.input_abstain_rate > 0:
+                        added = False
+                        for msg in conv:
+                            if msg.get("role") == "system":
+                                if self.abstain_prompt not in msg.get("content", ""):
+                                    msg["content"] = msg.get("content", "").rstrip() + " " + self.abstain_prompt
+                                added = True
+                                break
+                    conversations.append(conv)
+
                     user_q = chat_l[last_user_idx]["content"]
-                    segments_n = self._split_question_into_n_segments(user_q, min_num_segments)
-                    random.shuffle(segments_n)
+                    # input abstain format
+                    if random.random() < self.input_abstain_rate and len(segments_per_sample[j]) > min_num_segments:
+                        segments_n = self._split_question_into_n_segments(user_q, min_num_segments+1)
+                        random.shuffle(segments_n)
+                        segments_n = segments_n[:-1]
+                        required_reward_types.append("abstain")
+                    else:
+                        segments_n = self._split_question_into_n_segments(user_q, min_num_segments)
+                        random.shuffle(segments_n)
+                        required_reward_types.append("default")
+
                     segments_all.append(segments_n)
 
             assert num_samples == len(conversations) == len(segments_all), f"num_samples: {num_samples}, len(conversations): {len(conversations)}, len(segments_all): {len(segments_all)}"
@@ -536,7 +560,13 @@ class HFShardedMTRollout(BaseRollout):
                     },
                     batch_size=1,
                 )
-                sample_outputs.append(DataProto(batch=td))
+                # Pass required reward type information downstream via non_tensor_batch
+                sample_outputs.append(
+                    DataProto(
+                        batch=td,
+                        non_tensor_batch={"rollout_info": np.array([required_reward_types[s]], dtype=object)},
+                    )
+                )
 
         self.module.train()
         get_torch_device().empty_cache()

@@ -985,6 +985,12 @@ class RayPPOTrainer:
                             self.async_rollout_manager.wake_up()
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                             self.async_rollout_manager.sleep()
+                        # prompts = gen_batch_output.batch["prompts"]
+                        # input_list = self.tokenizer.batch_decode(prompts, skip_special_tokens=True)
+                        # responses = gen_batch_output.batch["responses"]  # tensor [bs, resp_len]
+                        # text_list = self.tokenizer.batch_decode(responses, skip_special_tokens=True)
+                        # print(text_list)
+                        # ray.util.pdb.set_trace()
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
@@ -1008,6 +1014,7 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+                    # ray.util.pdb.set_trace()
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -1020,6 +1027,7 @@ class RayPPOTrainer:
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    # ray.util.pdb.set_trace()
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
@@ -1043,7 +1051,7 @@ class RayPPOTrainer:
                         metrics.update(old_log_prob_metrics)
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
-
+                        # ray.util.pdb.set_trace()
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
                             rollout_old_log_probs = batch.batch["rollout_log_probs"]
@@ -1067,7 +1075,7 @@ class RayPPOTrainer:
                                     "training/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
                                 }
                             )
-
+                    # ray.util.pdb.set_trace()
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer("ref", timing_raw, color="olive"):
@@ -1076,13 +1084,13 @@ class RayPPOTrainer:
                             else:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
-
+                    # ray.util.pdb.set_trace()
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
-
+                    # ray.util.pdb.set_trace()
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
@@ -1101,7 +1109,7 @@ class RayPPOTrainer:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                         # compute advantages, executed on the driver process
-
+                        # ray.util.pdb.set_trace()
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
 
                         batch = compute_advantage(
@@ -1130,7 +1138,7 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
-
+                    # ray.util.pdb.set_trace()
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
@@ -1146,7 +1154,7 @@ class RayPPOTrainer:
                                 reward_extra_infos_dict=reward_extra_infos_dict,
                                 dump_path=rollout_data_dir,
                             )
-
+                    # ray.util.pdb.set_trace()
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
                         with marked_timer("testing", timing_raw, color="green"):
@@ -1173,6 +1181,15 @@ class RayPPOTrainer:
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
+                # ---------------- 计算“本 step reward” ----------------
+                # token_level_scores: (batch, seq_len)  → 按需汇总成标量
+                step_reward = batch.batch["token_level_scores"].sum(-1).mean().item()
+                metrics["training/step_reward_mean_for_curriculum"] = step_reward
+
+                # ---------------- CurriculumSampler 升级 ----------------
+                if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "update"):
+                    self.train_dataloader.sampler.update(step_reward)
+
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
@@ -1187,7 +1204,7 @@ class RayPPOTrainer:
                         self.critic_wg.stop_profile()
                     if self.use_rm:
                         self.rm_wg.stop_profile()
-
+                # ray.util.pdb.set_trace()
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()

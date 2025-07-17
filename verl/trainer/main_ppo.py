@@ -25,6 +25,15 @@ from omegaconf import OmegaConf
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 
+# if not ray.is_initialized():
+#     ray.init(
+#         runtime_env={
+#         "env_vars": {
+#             "RAY_DEBUG": "1",
+#             "HYDRA_FULL_ERROR": "1",
+#         }
+#     })
+
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
@@ -168,6 +177,7 @@ class TaskRunner:
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
+        # ray.util.pdb.set_trace()
         # Initialize the PPO trainer.
         trainer = RayPPOTrainer(
             config=config,
@@ -245,8 +255,19 @@ def create_rl_sampler(data_config, dataset):
     import torch
     from torch.utils.data import RandomSampler, SequentialSampler
 
-    # Use a sampler to facilitate checkpoint resumption.
-    # If shuffling is enabled in the data configuration, create a random sampler.
+    # 1. 自定义 Curriculum / Dynamic Sampler
+    if "custom_sampler" in data_config and data_config.custom_sampler.get("path", None):
+        from verl.utils.import_utils import load_extern_type
+
+        sampler_cls = load_extern_type(
+            data_config.custom_sampler.path,
+            data_config.custom_sampler.name,
+        )
+
+        sampler_kwargs = data_config.custom_sampler.get("kwargs", {})
+        return sampler_cls(dataset, **sampler_kwargs)
+
+    # 2. 默认逻辑（随机 / 顺序）
     if data_config.shuffle:
         train_dataloader_generator = torch.Generator()
         train_dataloader_generator.manual_seed(data_config.get("seed", 1))

@@ -44,16 +44,31 @@ data:
   # Whether to return the original input_ids without adding chat template.
   # This is used when the reward model's chat template differs from the policy.
   # If using a model-based RM with different templates, this should be True.
-  return_raw_input_ids: False
+  return_raw_input_ids: True
 
   # Whether to return the original chat (prompt) without applying chat template.
-  return_raw_chat: False
+  return_raw_chat: True
 
   # Whether to return the full prompt with chat template.
-  return_full_prompt: False
+  return_full_prompt: True
 
   # Whether to shuffle the data in the dataloader.
   shuffle: True
+
+  # Custom sampler for curriculum learning
+  # If using this sampler, set total_epochs as 1
+  custom_sampler:
+
+    path: null
+    # path: verl/utils/dataset/curriculum_sampler.py
+
+    name: Sampler
+    # name: CurriculumSampler
+
+    kwargs:
+    
+      reward_threshold: 0
+      # reward_threshold: 0.8
 
   # Whether to shuffle the validation set.
   validation_shuffle: False
@@ -382,7 +397,10 @@ actor_rollout_ref:
   rollout:
 
     # actor_rollout_ref.rollout.name: hf/vllm/sglang.
-    name: vllm
+    name: hf_sharded_mt
+
+    # rollout abstain rate, only for hf_sharded_mt_rollout
+    input_abstain_rate: 0
 
     # sync: LLM, async: AsyncLLM
     mode: sync
@@ -838,9 +856,11 @@ custom_reward_function:
   # The path to the file containing your customized reward function.
   # If not specified, pre-implemented reward functions will be used.
   path: null
+  # path: verl/utils/reward_score/reward_abstain_and_default.py
 
   # The name of the reward function within the specified file. Default is 'compute_score'.
   name: compute_score
+  # name: compute_score_reward_abstain_and_default
 
 # config for the algorithm
 algorithm:
