@@ -402,6 +402,9 @@ actor_rollout_ref:
     # rollout abstain rate, only for hf_sharded_mt_rollout
     input_abstain_rate: 0
 
+    # max shard count, only for hf_sharded_mt_rollout
+    max_shard_count: 10
+
     # sync: LLM, async: AsyncLLM
     mode: sync
 

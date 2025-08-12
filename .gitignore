@@ -126,5 +126,10 @@ outputs
 .history
 
 *.json
+*.jsonl
 lic_sharded_to_parquet.py
 *.sh
+*.slurm
+
+workspace/
+data/livecodebench/

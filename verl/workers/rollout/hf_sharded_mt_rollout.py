@@ -55,6 +55,7 @@ class HFShardedMTRollout(BaseRollout):
         self.segment_token_length = self.config.get("segment_token_length", 128)
 
         self.input_abstain_rate = config.get("input_abstain_rate", 0.0)
+        self.max_shard_count = config.get("max_shard_count", 10)
         self.abstain_prompt = "If you believe the question is not solvable, reason step by step and output \\boxed{abstain}."
 
     def _sanity_check(self, dp: DataProto, pad_token_id: int, tokenizer):
@@ -206,17 +207,39 @@ class HFShardedMTRollout(BaseRollout):
         reconstructed = torch.cat([prompts, responses], dim=1)
         assert torch.equal(input_ids, reconstructed), "input_ids != cat(prompts, responses)"
 
-    def _split_question_into_segments(self, question: str, *, shuffle: bool = False):
+    def _split_question_into_segments(self, question: str, *, shuffle: bool = False, task_type: str = None):
         """
         Split question into segments by sentence delimiters and remove trailing commas/semicolons.
         If shuffle=True, randomly shuffle the order before returning.
         """
 
-        delimiter_pattern = (
-            r"([。！？!?；;:]|"        # Full/half-width sentence endings
-            r"(?<!\d)[,，](?!\d)|"    # Commas, excluding digit separators
-            r"(?<!\d)\.(?!\d))"       # Periods, excluding decimals
-        )
+        if task_type == 'math':
+            delimiter_pattern = (
+                r"([。！？!?；;:]|"        # Full/half-width sentence endings
+                r"(?<!\d)[,，](?!\d)|"    # Commas, excluding digit separators
+                r"(?<!\d)\.(?!\d))"       # Periods, excluding decimals
+            )
+        elif task_type == 'code':
+            delimiter_pattern = r"([。！？!?]|(?<!\d)\.(?!\d)|\n+)"
+
+            # Used for code examples
+            markers = [
+                "\n\nInput", 
+                "\n$Example:$", 
+                "\n\nExample", 
+                "\n-----Input-----", 
+                "\n\n# Example",
+                "\n\n# Input",
+                "\n\n# Output",
+                "\n\n-----Constraints-----",
+                "\nExample",
+                "\n\n For example:",
+                "\n------ Input Format ------"
+            ]
+            cut_positions = [question.find(m) for m in markers if question.find(m) != -1]
+            question = question[: min(cut_positions)].strip()
+            examples = question[min(cut_positions):].strip()
+
 
         parts = re.split(delimiter_pattern, question)
         segments, buf = [], ""
@@ -225,8 +248,13 @@ class HFShardedMTRollout(BaseRollout):
             if not frag:
                 continue
             if re.match(delimiter_pattern, frag):
-                buf += frag
-                seg = re.sub(r"[，,；;]+$", "", buf.strip())  # Remove trailing commas/semicolons
+                if task_type == 'math':
+                    buf += frag
+                    seg = re.sub(r"[，,；;]+$", "", buf.strip())  # Remove trailing commas/semicolons
+                elif task_type == 'code':
+                    if not frag.startswith("\n"):
+                        buf += frag
+                    seg = buf.strip()
                 if seg:
                     segments.append(seg)
                 buf = ""
@@ -234,14 +262,17 @@ class HFShardedMTRollout(BaseRollout):
                 buf += frag
 
         if buf.strip():
-            segments.append(re.sub(r"[，,；;]+$", "", buf.strip()))
+            if task_type == 'math':
+                segments.append(re.sub(r"[，,；;]+$", "", buf.strip()))
+            elif task_type == 'code':
+                segments.append(buf.strip())
 
-        if shuffle:
-            random.shuffle(segments)
+        if task_type == 'code':
+            segments.append(examples)
 
         return segments or [question]
 
-    def _split_question_into_n_segments(self, question: str, n: int):
+    def _split_question_into_n_segments(self, question: str, n: int, *, task_type: str = None):
         """
         Randomly select n-1 sentence boundary cut points to split question into exactly n segments.
         
@@ -250,11 +281,33 @@ class HFShardedMTRollout(BaseRollout):
         and adjusts to ensure n segments.
         """
 
-        delimiter_pattern = (
-            r"([。！？!?；;:]|"        # Sentence endings
-            r"(?<!\d)[,，](?!\d)|"    # Commas excluding digit grouping
-            r"(?<!\d)\.(?!\d))"       # Periods excluding decimals
-        )
+        if task_type == 'math':
+            delimiter_pattern = (
+                r"([。！？!?；;:]|"        # Sentence endings
+                r"(?<!\d)[,，](?!\d)|"    # Commas excluding digit grouping
+                r"(?<!\d)\.(?!\d))"       # Periods excluding decimals
+            )
+        elif task_type == 'code':
+            delimiter_pattern = r"([。！？!?]|(?<!\d)\.(?!\d)|\n+)"
+
+            # Used for code examples
+            markers = [
+                "\n\nInput", 
+                "\n$Example:$", 
+                "\n\nExample", 
+                "\n-----Input-----", 
+                "\n\n# Example",
+                "\n\n# Input",
+                "\n\n# Output",
+                "\n\n-----Constraints-----",
+                "\nExample",
+                "\n\n For example:",
+                "\n------ Input Format ------"
+            ]
+            cut_positions = [question.find(m) for m in markers if question.find(m) != -1]
+            question_ori = question
+            question = question[: min(cut_positions)].strip()
+            examples = question_ori[min(cut_positions):].strip()
 
         # Collect valid cut points (after punctuation), excluding text end to avoid empty segments
         cut_positions = [
@@ -263,20 +316,45 @@ class HFShardedMTRollout(BaseRollout):
         ]
 
         # Fallback if insufficient cut points or n<=1
-        if len(cut_positions) < n - 1 or n <= 1:
-            return [question]
+        if task_type == 'code':
+            if n == 1:
+                return [question_ori]
+            elif n == 2:
+                return [question, examples]
 
-        # Select n-1 cut points and sort
-        chosen = sorted(random.sample(cut_positions, n - 1))
+            # Select up to (n-2) cut points and sort. If not enough cut points,
+            # we will duplicate the last segment to reach exactly n segments.
+            k = min(n - 2, len(cut_positions))
+            chosen = sorted(random.sample(cut_positions, k))
+
+        else:
+            if len(cut_positions) < n - 1 or n <= 1:
+                return [question]
+
+            # Select n-1 cut points and sort
+            chosen = sorted(random.sample(cut_positions, n - 1))
 
         # Generate segments, removing trailing commas/semicolons
         segments, prev = [], 0
         for cut in chosen + [len(question)]:
             seg = question[prev:cut].strip()
-            seg = re.sub(r"[，,；;]+$", "", seg)
+            if task_type == 'math':
+                seg = re.sub(r"[，,；;]+$", "", seg)
+            elif task_type == 'code':
+                seg = seg.strip()
             segments.append(seg)
             prev = cut
 
+        # Ensure the number of segments matches expectation
+        if task_type == 'code':
+            # For code tasks with examples, append examples as the last segment
+            # to make the total segments equal to n.
+            while len(segments) < n - 1:
+                # Duplicate last available segment to pad
+                segments.append(segments[-1] if segments else question)
+            segments.append(examples)
+            return segments
+        
         return segments
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
@@ -349,11 +427,18 @@ class HFShardedMTRollout(BaseRollout):
             for chat in raw_prompts:
                 # convert ndarray to list when necessary
                 chat_list = chat.tolist() if isinstance(chat, np.ndarray) else chat
+                task_type = None
+                if 'Python' in chat_list[0]['content']:
+                    task_type = 'code'
+                elif 'mathematical' in chat_list[0]['content']:
+                    task_type = 'math'
+                else:
+                    task_type = 'math'
 
                 # locate last user message within the conversation
                 last_user_idx = max(i for i, m in enumerate(chat_list) if m["role"] == "user")
                 user_question = chat_list[last_user_idx]["content"]
-                segments_tmp = self._split_question_into_segments(user_question)
+                segments_tmp = self._split_question_into_segments(user_question, task_type=task_type)
                 segments_per_sample.append(segments_tmp)
                 num_segments_per_sample.append(len(segments_tmp))
 
@@ -368,6 +453,8 @@ class HFShardedMTRollout(BaseRollout):
                 min_num_segments = int(min_seg_tensor.item())
             else:
                 min_num_segments = local_min_seg
+
+            min_num_segments = min(min_num_segments, self.max_shard_count)
 
             # print(f"min_num_segments: {min_num_segments}", flush=True)
 
@@ -384,6 +471,15 @@ class HFShardedMTRollout(BaseRollout):
             segments_all = []   # list[list[str]]
             required_reward_types = []
             for j, chat in enumerate(raw_prompts):
+                chat_list = chat.tolist() if isinstance(chat, np.ndarray) else chat
+                task_type = None
+                if 'Python' in chat_list[0]['content']:
+                    task_type = 'code'
+                elif 'mathematical' in chat_list[0]['content']:
+                    task_type = 'math'
+                else:
+                    task_type = 'math' 
+
                 for i in range(config_n): # n rollouts
                     chat_l = chat.tolist() if isinstance(chat, np.ndarray) else chat
                     last_user_idx = max(i for i, m in enumerate(chat_l) if m["role"] == "user")
@@ -402,17 +498,18 @@ class HFShardedMTRollout(BaseRollout):
                     user_q = chat_l[last_user_idx]["content"]
                     # input abstain format
                     if random.random() < self.input_abstain_rate and len(segments_per_sample[j]) > min_num_segments:
-                        segments_n = self._split_question_into_n_segments(user_q, min_num_segments+1)
-                        random.shuffle(segments_n)
+                        segments_n = self._split_question_into_n_segments(user_q, min_num_segments+1, task_type=task_type)
+                        # random.shuffle(segments_n)
                         segments_n = segments_n[:-1]
                         required_reward_types.append("abstain")
                     else:
-                        segments_n = self._split_question_into_n_segments(user_q, min_num_segments)
-                        random.shuffle(segments_n)
+                        segments_n = self._split_question_into_n_segments(user_q, min_num_segments, task_type=task_type)
+                        # random.shuffle(segments_n)
                         required_reward_types.append("default")
 
                     segments_all.append(segments_n)
 
+            # ray.util.pdb.set_trace()
             assert num_samples == len(conversations) == len(segments_all), f"num_samples: {num_samples}, len(conversations): {len(conversations)}, len(segments_all): {len(segments_all)}"
 
             # ray.util.pdb.set_trace()
