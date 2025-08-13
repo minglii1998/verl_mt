@@ -74,7 +74,7 @@ data:
   validation_shuffle: False
 
   # Whether to filter overlong prompts.
-  filter_overlong_prompts: False
+  filter_overlong_prompts: True
 
   # Number of workers for filtering overlong prompts.
   # For large-scale datasets, filtering can be time-consuming.
