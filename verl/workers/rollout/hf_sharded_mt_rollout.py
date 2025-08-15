@@ -56,6 +56,9 @@ class HFShardedMTRollout(BaseRollout):
 
         self.input_abstain_rate = config.get("input_abstain_rate", 0.0)
         self.max_shard_count = config.get("max_shard_count", 10)
+        # Whether to respect curriculum-controlled segment count
+        self.curriculum_segments_enabled = config.get("curriculum_segments_enabled", False)
+        self.num_segments_required = config.get("num_segments_required", 1) if self.curriculum_segments_enabled else 999
         self.abstain_prompt = "If you believe the question is not solvable, reason step by step and output \\boxed{abstain}."
 
     def _sanity_check(self, dp: DataProto, pad_token_id: int, tokenizer):
@@ -418,6 +421,13 @@ class HFShardedMTRollout(BaseRollout):
             eos_token_id = prompts.meta_info["eos_token_id"]
             pad_token_id = prompts.meta_info["pad_token_id"]
 
+            # Curriculum parameter passed from trainer (if any)
+            num_segments_required = prompts.meta_info.get("num_segments_required", self.num_segments_required)
+
+            # If curriculum disabled, effectively ignore it by setting a large requirement
+            if not self.curriculum_segments_enabled:
+                num_segments_required = 999
+
             raw_prompts = prompts.non_tensor_batch["raw_prompt"]
 
             # Determine minimum number of segments across all samples
@@ -454,7 +464,7 @@ class HFShardedMTRollout(BaseRollout):
             else:
                 min_num_segments = local_min_seg
 
-            min_num_segments = min(min_num_segments, self.max_shard_count)
+            min_num_segments = min(num_segments_required, min_num_segments, self.max_shard_count)
 
             # print(f"min_num_segments: {min_num_segments}", flush=True)
 
@@ -672,3 +682,7 @@ class HFShardedMTRollout(BaseRollout):
         self._sanity_check(batch_data_proto, pad_token_id, self.tokenizer)
         # ray.util.pdb.set_trace()
         return batch_data_proto
+
+    def update_num_segments_required(self, num_segments_required: int):
+        """Dynamically update the minimum segment count used during generation."""
+        self.num_segments_required = num_segments_required

@@ -21,7 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
@@ -336,6 +336,18 @@ class RayPPOTrainer:
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
+
+        # ----- Curriculum settings for segment count -----
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+
+        # Whether to activate curriculum-based dynamic segment control
+        self.enable_curriculum_segments = rollout_cfg.get("curriculum_segments_enabled", False)
+
+        # Curriculum parameters (only used when enabled)
+        self.num_segments_required = rollout_cfg.get("num_segments_required", 1) if self.enable_curriculum_segments else 999
+        self.segment_reward_window = rollout_cfg.get("segment_reward_window", 10)
+        self.segment_threshold_factor = rollout_cfg.get("segment_threshold_factor", 0.8)
+        self.recent_rewards = deque(maxlen=self.segment_reward_window)
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -902,6 +914,28 @@ class RayPPOTrainer:
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _update_num_segments_required(self, step_reward: float):
+        """Update `num_segments_required` based on recent reward statistics."""
+        if not self.enable_curriculum_segments:
+            return
+        # Accumulate rewards
+        self.recent_rewards.append(step_reward)
+
+        # Only update when we have enough history
+        if len(self.recent_rewards) < self.segment_reward_window:
+            return
+
+        avg_reward = sum(self.recent_rewards) / len(self.recent_rewards)
+        threshold = avg_reward * self.segment_threshold_factor
+
+        if step_reward > threshold:
+            self.num_segments_required += 1
+
+            # Update local config so that any newly spawned workers inherit the new value
+            from omegaconf import open_dict
+            with open_dict(self.config.actor_rollout_ref.rollout):
+                self.config.actor_rollout_ref.rollout.num_segments_required = self.num_segments_required
+
     def fit(self):
         """
         The training loop of PPO.
@@ -973,6 +1007,10 @@ class RayPPOTrainer:
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
+
+                # Pass curriculum parameter to rollout via meta_info (only if enabled)
+                if self.enable_curriculum_segments:
+                    gen_batch.meta_info["num_segments_required"] = self.num_segments_required
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -1185,6 +1223,11 @@ class RayPPOTrainer:
                 # token_level_scores: (batch, seq_len)  → 按需汇总成标量
                 step_reward = batch.batch["token_level_scores"].sum(-1).mean().item()
                 metrics["training/step_reward_mean_for_curriculum"] = step_reward
+
+                # -------- Update curriculum-controlled segment number --------
+                if self.enable_curriculum_segments:
+                    self._update_num_segments_required(step_reward)
+                metrics["training/num_segments_required"] = self.num_segments_required
 
                 # ---------------- CurriculumSampler 升级 ----------------
                 if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "update"):

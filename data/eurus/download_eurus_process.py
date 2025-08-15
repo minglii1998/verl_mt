@@ -168,14 +168,14 @@ def main():
     random.shuffle(processed_samples)
 
     # Determine split sizes
-    train_size = min(2000, len(processed_samples))
+    train_size = min(1000, len(processed_samples))
     eval_size = min(100, max(0, len(processed_samples) - train_size))
 
     train_samples = processed_samples[:train_size]
     eval_samples = processed_samples[train_size : train_size + eval_size]
 
     # Output files
-    train_path = "data/eurus/eurus_code_examples_2000.json"
+    train_path = "data/eurus/eurus_code_examples_1000.json"
     eval_path = "data/eurus/eurus_code_examples_eval_100.json"
 
     with open(train_path, "w", encoding="utf-8") as f:

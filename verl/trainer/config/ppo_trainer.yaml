@@ -405,6 +405,12 @@ actor_rollout_ref:
     # max shard count, only for hf_sharded_mt_rollout
     max_shard_count: 10
 
+    # Curriculum learning parameters for controlling number of segments
+    curriculum_segments_enabled: false   # set true to enable dynamic segment curriculum
+    num_segments_required: 1        # initial minimum segment count
+    segment_reward_window: 10      # number of recent steps to average reward over
+    segment_threshold_factor: 0.8   # threshold multiplier
+
     # sync: LLM, async: AsyncLLM
     mode: sync
 

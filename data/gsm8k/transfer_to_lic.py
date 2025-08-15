@@ -98,44 +98,25 @@ def process_split(input_path: str):
             extra_info["segment_count"] = segment_count
             record["extra_info"] = extra_info
 
-        # 判断是train还是test，根据文件名
+        # 判断是 train 还是 test，根据文件名
+        segment_threshold = 7  # 只保留不少于该分段数量的样本
         if "test" in input_path:
             sample_size = 100
         else:
-            sample_size = 2000
+            sample_size = 1000
 
+        # 过滤出满足 segment_threshold 的样本
+        records = [rec for rec in records if rec.get("extra_info", {}).get("segment_count", 0) >= segment_threshold]
+
+        # 如果样本数量仍然超过 sample_size，则随机抽样
         if len(records) > sample_size:
-            # 先过滤出 segment 数量大于 1 的样本
-            filtered_records = []
-            for rec in records:
-                # 找到最后一个 user message
-                prompt_list = rec.get("prompt", [])
-                if isinstance(prompt_list, str):
-                    try:
-                        prompt_list = json.loads(prompt_list)
-                    except Exception:
-                        prompt_list = []
-                user_msgs = [m for m in prompt_list if m.get("role") == "user" and isinstance(m.get("content"), str)]
-                if user_msgs:
-                    last_user_msg = user_msgs[-1]
-                    segments = _split_question_into_segments(last_user_msg["content"])
-                    if len(segments) > 1:
-                        filtered_records.append(rec)
-
-            # 如果过滤后数量不足，补充剩余的
-            if len(filtered_records) >= sample_size:
-                records = random.sample(filtered_records, sample_size)
-            else:
-                # 补充 segment 数量 <=1 的样本
-                remaining = [rec for rec in records if rec not in filtered_records]
-                needed = sample_size - len(filtered_records)
-                records = filtered_records + random.sample(remaining, min(needed, len(remaining)))
+            records = random.sample(records, sample_size)
 
         # 按 segment_count 从大到小排序
         records.sort(key=lambda rec: rec.get("extra_info", {}).get("segment_count", 0), reverse=False)
 
         # 保存修改后的数据
-        output_path = f"data/gsm8k/{input_path.split('/')[-1].split('.')[0]}_lic_format_{sample_size}.json"
+        output_path = f"data/gsm8k/gsm_math_{input_path.split('/')[-1].split('.')[0]}_{sample_size}.json"
         # 保存 JSONLines
         with open(output_path, "w", encoding="utf-8") as f:
             for rec in records:
@@ -143,7 +124,7 @@ def process_split(input_path: str):
                 f.write("\n")
 
         # 保存为新的 Parquet 文件
-        parquet_output_path = f"data/gsm8k/{input_path.split('/')[-1].split('.')[0]}_lic_format_{sample_size}.parquet"
+        parquet_output_path = f"data/gsm8k/gsm_math_{input_path.split('/')[-1].split('.')[0]}_{sample_size}.parquet"
         pd.DataFrame(records).to_parquet(parquet_output_path, index=False)
 
 if __name__ == "__main__":
