@@ -22,6 +22,7 @@ import json
 import os
 import uuid
 from collections import defaultdict, deque
+import random
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
@@ -348,6 +349,11 @@ class RayPPOTrainer:
         self.segment_reward_window = rollout_cfg.get("segment_reward_window", 10)
         self.segment_threshold_factor = rollout_cfg.get("segment_threshold_factor", 0.8)
         self.recent_rewards = deque(maxlen=self.segment_reward_window)
+
+        # Curriculum internal states
+        self.max_shard_count = rollout_cfg.get("max_shard_count", 10)
+        self.random_segments = False  # switch to random mode after hitting maximum and still improving
+        self.steps_since_upgrade = 0  # counter to ensure waiting window between upgrades
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -918,23 +924,37 @@ class RayPPOTrainer:
         """Update `num_segments_required` based on recent reward statistics."""
         if not self.enable_curriculum_segments:
             return
-        # Accumulate rewards
-        self.recent_rewards.append(step_reward)
 
-        # Only update when we have enough history
+        # step counter for window after last upgrade
+        self.steps_since_upgrade += 1
+
+        # Only evaluate for upgrade when window length satisfied
         if len(self.recent_rewards) < self.segment_reward_window:
+            return
+
+        if self.steps_since_upgrade < self.segment_reward_window:
             return
 
         avg_reward = sum(self.recent_rewards) / len(self.recent_rewards)
         threshold = avg_reward * self.segment_threshold_factor
 
         if step_reward > threshold:
-            self.num_segments_required += 1
+            if self.num_segments_required < self.max_shard_count:
+                self.num_segments_required += 1
+                # reset states after upgrade
+                self.recent_rewards.clear()
+                self.steps_since_upgrade = 0
 
-            # Update local config so that any newly spawned workers inherit the new value
-            from omegaconf import open_dict
-            with open_dict(self.config.actor_rollout_ref.rollout):
-                self.config.actor_rollout_ref.rollout.num_segments_required = self.num_segments_required
+                # Update config for potential new workers
+                from omegaconf import open_dict
+                with open_dict(self.config.actor_rollout_ref.rollout):
+                    self.config.actor_rollout_ref.rollout.num_segments_required = self.num_segments_required
+
+            else:
+                # Already at max, switch to random mode after waiting window
+                self.random_segments = True
+                self.recent_rewards.clear()
+                self.steps_since_upgrade = 0
 
     def fit(self):
         """
@@ -1010,7 +1030,10 @@ class RayPPOTrainer:
 
                 # Pass curriculum parameter to rollout via meta_info (only if enabled)
                 if self.enable_curriculum_segments:
-                    gen_batch.meta_info["num_segments_required"] = self.num_segments_required
+                    if self.random_segments:
+                        gen_batch.meta_info["num_segments_required"] = random.randint(1, self.max_shard_count)
+                    else:
+                        gen_batch.meta_info["num_segments_required"] = self.num_segments_required
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
