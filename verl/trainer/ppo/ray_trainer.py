@@ -354,6 +354,7 @@ class RayPPOTrainer:
         self.max_shard_count = rollout_cfg.get("max_shard_count", 10)
         self.random_segments = False  # switch to random mode after hitting maximum and still improving
         self.steps_since_upgrade = 0  # counter to ensure waiting window between upgrades
+        self.fixed_threshold = None  # determined after first window collected
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -925,20 +926,46 @@ class RayPPOTrainer:
         if not self.enable_curriculum_segments:
             return
 
+        # Record reward
+        self.recent_rewards.append(step_reward)
         # step counter for window after last upgrade
         self.steps_since_upgrade += 1
 
-        # Only evaluate for upgrade when window length satisfied
+        # -------- refresh debug metrics before exit --------
+        self.debug_len_window = len(self.recent_rewards)
+        self.debug_steps_since_upgrade = self.steps_since_upgrade
+
+        # initialise debug placeholders (will refresh again before return)
+        self.debug_avg_reward = None
+        self.debug_threshold = None
+        self.debug_threshold = self.fixed_threshold
+
+        # initialize fixed threshold once we have the first full window
+        if self.fixed_threshold is None:
+            if len(self.recent_rewards) < self.segment_reward_window:
+                # still collecting initial window
+                return
+            # window just filled – set fixed threshold and allow immediate evaluation
+            avg0 = sum(self.recent_rewards) / self.segment_reward_window
+            self.fixed_threshold = avg0 * self.segment_threshold_factor
+            # treat as if cooldown already satisfied so we can upgrade right away if condition met
+            self.steps_since_upgrade = self.segment_reward_window
+
+        # ensure we always have a full window before evaluating (after threshold fixed this is guaranteed)
         if len(self.recent_rewards) < self.segment_reward_window:
             return
 
+        avg_reward = sum(self.recent_rewards) / len(self.recent_rewards)
+
+        # temporary store for evaluation stage
+        eval_avg = avg_reward
+        self.debug_avg_reward = eval_avg if 'eval_avg' in locals() else None
+
+        # ensure cool-down window passed
         if self.steps_since_upgrade < self.segment_reward_window:
             return
 
-        avg_reward = sum(self.recent_rewards) / len(self.recent_rewards)
-        threshold = avg_reward * self.segment_threshold_factor
-
-        if step_reward > threshold:
+        if avg_reward > self.fixed_threshold:
             if self.num_segments_required < self.max_shard_count:
                 self.num_segments_required += 1
                 # reset states after upgrade
@@ -1245,12 +1272,24 @@ class RayPPOTrainer:
                 # ---------------- 计算“本 step reward” ----------------
                 # token_level_scores: (batch, seq_len)  → 按需汇总成标量
                 step_reward = batch.batch["token_level_scores"].sum(-1).mean().item()
-                metrics["training/step_reward_mean_for_curriculum"] = step_reward
 
                 # -------- Update curriculum-controlled segment number --------
+                metrics["curr/num_segments_required"] = gen_batch.meta_info["num_segments_required"]
                 if self.enable_curriculum_segments:
                     self._update_num_segments_required(step_reward)
-                metrics["training/num_segments_required"] = self.num_segments_required
+
+                # -------- Debug curriculum metrics --------
+                if self.enable_curriculum_segments:
+                    metrics.update(
+                        {
+                            "curr/len_window": getattr(self, "debug_len_window", 0),
+                            "curr/steps_since_upgrade": getattr(self, "debug_steps_since_upgrade", 0),
+                            "curr/avg_reward": getattr(self, "debug_avg_reward", 0.0),
+                            "curr/threshold": getattr(self, "debug_threshold", 0.0),
+                            "curr/random_mode": int(self.random_segments),
+                        }
+                    )
+                metrics["curr/step_reward_mean_for_curriculum"] = step_reward
 
                 # ---------------- CurriculumSampler 升级 ----------------
                 if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "update"):
