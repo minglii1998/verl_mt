@@ -411,6 +411,9 @@ actor_rollout_ref:
     segment_reward_window: 10      # number of recent steps to average reward over
     segment_threshold_factor: 0.8   # threshold multiplier
 
+    # micro batch size for rollout, if used with hf_sharded_mt, it is before multi-turn split
+    micro_batch_size: null
+
     # sync: LLM, async: AsyncLLM
     mode: sync
 

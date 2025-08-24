@@ -583,7 +583,10 @@ class HFShardedMTRollout(BaseRollout):
                 # if assistant_text_list:
                 #     max_text = max(assistant_text_list, key=len)
                 #     print(f"t={t}, seq_batch: {seq_batch.shape}, longest_assistant_text: {[max_text]}", flush=True)
-                    
+
+                del out, seq_batch, input_ids, attention_mask, position_ids_batch
+                torch.cuda.empty_cache()
+                
                 if t == min_num_segments - 1:
                     for s in range(num_samples):
                         last_prompt_ids_lst[s] = input_ids[s:s+1].clone()
