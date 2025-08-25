@@ -364,9 +364,101 @@ class HFShardedMTRollout(BaseRollout):
         batch_size = prompts.batch.batch_size[0]
         num_chunks = max(batch_size // self.config.get("micro_batch_size", batch_size), 1)
         batch_prompts = prompts.chunk(chunks=num_chunks)
-        output = [self._generate_multi_turn(p) for p in batch_prompts]
-        output = DataProto.concat(output)
-        return output
+        outputs = [self._generate_multi_turn(p) for p in batch_prompts]
+        
+        # 统一所有输出的序列长度
+        if len(outputs) > 1:
+            # 验证micro-batch输出一致性
+            self._validate_all_outputs_consistent(outputs)
+            
+            max_seq_len = max(output.batch["input_ids"].size(1) for output in outputs)
+            pad_token_id = prompts.meta_info["pad_token_id"]
+            
+            unified_outputs = []
+            for output in outputs:
+                if output.batch["input_ids"].size(1) < max_seq_len:
+                    # 需要padding到统一长度
+                    output = self._pad_dataproto_to_length(output, max_seq_len, pad_token_id)
+                unified_outputs.append(output)
+            
+            final_output = DataProto.concat(unified_outputs)
+        else:
+            # 只有一个micro-batch，直接返回
+            final_output = outputs[0]
+        
+        # 最终安全验证
+        self._validate_format_consistency(final_output, self.config.response_length)
+        self._sanity_check(final_output, prompts.meta_info["pad_token_id"], self.tokenizer)
+        
+        return final_output
+
+    def _pad_dataproto_to_length(self, data_proto: DataProto, target_length: int, pad_token_id: int) -> DataProto:
+        """将DataProto中的张量padding到指定长度"""
+        td = data_proto.batch
+        current_length = td["input_ids"].size(1)
+        
+        if current_length >= target_length:
+            return data_proto
+        
+        pad_size = target_length - current_length
+        batch_size = td.batch_size[0]
+        device = td["input_ids"].device
+        dtype_ids = td["input_ids"].dtype
+        dtype_mask = td["attention_mask"].dtype
+        
+        # 创建padding张量
+        pad_ids = torch.full((batch_size, pad_size), pad_token_id, dtype=dtype_ids, device=device)
+        pad_attention = torch.zeros((batch_size, pad_size), dtype=dtype_mask, device=device)
+        
+        # 拼接padding（左padding）
+        padded_input_ids = torch.cat([pad_ids, td["input_ids"]], dim=1)
+        padded_attention_mask = torch.cat([pad_attention, td["attention_mask"]], dim=1)
+        
+        # 重新计算position_ids
+        padded_position_ids = compute_position_id_with_mask(padded_attention_mask)
+        
+        # 更新prompts张量（也需要左padding）
+        prompts = td["prompts"]
+        prompt_length = prompts.size(1)
+        pad_prompts = torch.full((batch_size, pad_size), pad_token_id, dtype=dtype_ids, device=device)
+        padded_prompts = torch.cat([pad_prompts, prompts], dim=1)
+        
+        # responses保持不变
+        responses = td["responses"]
+    
+        # 创建新的TensorDict
+        new_td = TensorDict(
+            {
+                "prompts": padded_prompts,
+                "responses": responses,
+                "input_ids": padded_input_ids,
+                "attention_mask": padded_attention_mask,
+                "position_ids": padded_position_ids,
+            },
+            batch_size=batch_size,
+        )
+        
+        # 返回新的DataProto，保持non_tensor_batch不变
+        return DataProto(
+            batch=new_td,
+            non_tensor_batch=data_proto.non_tensor_batch,
+            meta_info=data_proto.meta_info,
+        )
+
+    def _validate_all_outputs_consistent(self, outputs: list) -> None:
+        """验证所有micro-batch输出的一致性"""
+        if len(outputs) <= 1:
+            return
+        
+        # 检查response_length是否一致
+        response_lengths = [output.batch["responses"].size(1) for output in outputs]
+        assert len(set(response_lengths)) == 1, f"Response lengths inconsistent across micro-batches: {response_lengths}"
+        
+        # 检查其他关键维度
+        for i, output in enumerate(outputs[1:], 1):
+            ref_output = outputs[0]
+            assert output.batch["responses"].size(1) == ref_output.batch["responses"].size(1), \
+                f"Micro-batch {i} response length {output.batch['responses'].size(1)} != reference {ref_output.batch['responses'].size(1)}"
 
     @torch.no_grad()
     def _generate_multi_turn(self, prompts: DataProto) -> DataProto:
@@ -583,9 +675,6 @@ class HFShardedMTRollout(BaseRollout):
                 # if assistant_text_list:
                 #     max_text = max(assistant_text_list, key=len)
                 #     print(f"t={t}, seq_batch: {seq_batch.shape}, longest_assistant_text: {[max_text]}", flush=True)
-
-                del out, seq_batch, input_ids, attention_mask, position_ids_batch
-                torch.cuda.empty_cache()
                 
                 if t == min_num_segments - 1:
                     for s in range(num_samples):
@@ -594,6 +683,9 @@ class HFShardedMTRollout(BaseRollout):
                         last_position_ids_lst[s] = position_ids_batch[s:s+1].clone()
                         last_seq_lst[s] = seq_batch[s:s+1].clone()
                 # ray.util.pdb.set_trace()
+
+                del out, seq_batch, input_ids, attention_mask, position_ids_batch
+                torch.cuda.empty_cache()
 
             # Build & left-pad outputs in a single pass
             seq_lengths = []
