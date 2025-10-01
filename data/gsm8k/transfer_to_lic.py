@@ -86,6 +86,10 @@ def process_split(input_path: str):
             else:
                 segment_count = 0
 
+            for segment in segments:
+                if len(segment.strip().split(' ')) < 4:
+                    segment_count = 0
+
             # 更新或创建 extra_info 字段
             extra_info = record.get("extra_info", {})
             if isinstance(extra_info, str):
@@ -99,11 +103,11 @@ def process_split(input_path: str):
             record["extra_info"] = extra_info
 
         # 判断是 train 还是 test，根据文件名
-        segment_threshold = 7  # 只保留不少于该分段数量的样本
+        segment_threshold = 5  # 只保留不少于该分段数量的样本
         if "test" in input_path:
             sample_size = 100
         else:
-            sample_size = 1000
+            sample_size = 2000
 
         # 过滤出满足 segment_threshold 的样本
         records = [rec for rec in records if rec.get("extra_info", {}).get("segment_count", 0) >= segment_threshold]
