@@ -341,6 +341,9 @@ class RayPPOTrainer:
         # ----- Curriculum settings for segment count -----
         rollout_cfg = self.config.actor_rollout_ref.rollout
 
+        # store base input_abstain_rate from config for later use
+        self.base_input_abstain_rate = rollout_cfg.get("input_abstain_rate", 0.0)
+
         # Whether to activate curriculum-based dynamic segment control
         self.enable_curriculum_segments = rollout_cfg.get("curriculum_segments_enabled", False)
 
@@ -1061,6 +1064,12 @@ class RayPPOTrainer:
                         gen_batch.meta_info["num_segments_required"] = random.randint(1, self.max_shard_count)
                     else:
                         gen_batch.meta_info["num_segments_required"] = self.num_segments_required
+
+                # ------- Control abstain rate before first reward window full -------
+                if self.fixed_threshold is None:
+                    gen_batch.meta_info["input_abstain_rate"] = 0.0
+                else:
+                    gen_batch.meta_info["input_abstain_rate"] = self.base_input_abstain_rate
 
                 is_last_step = self.global_steps >= self.total_training_steps
 

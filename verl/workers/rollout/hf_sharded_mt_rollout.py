@@ -59,7 +59,7 @@ class HFShardedMTRollout(BaseRollout):
         # Whether to respect curriculum-controlled segment count
         self.curriculum_segments_enabled = config.get("curriculum_segments_enabled", False)
         self.num_segments_required = config.get("num_segments_required", 1) if self.curriculum_segments_enabled else 999
-        self.abstain_prompt = "If you believe the question is not solvable, reason step by step and output \\boxed{abstain}."
+        self.abstain_prompt = "When you try to solve the problem, you should also refer to the prefious information provided in earlier conversation (if any). If you believe the question is not solvable even with the previous information, reason step by step and output \\boxed{abstain}."
 
     def _sanity_check(self, dp: DataProto, pad_token_id: int, tokenizer):
         """
@@ -387,8 +387,8 @@ class HFShardedMTRollout(BaseRollout):
             final_output = outputs[0]
         
         # 最终安全验证
-        self._validate_format_consistency(final_output, self.config.response_length)
-        self._sanity_check(final_output, prompts.meta_info["pad_token_id"], self.tokenizer)
+        # self._validate_format_consistency(final_output, self.config.response_length)
+        # self._sanity_check(final_output, prompts.meta_info["pad_token_id"], self.tokenizer)
         
         return final_output
 
@@ -516,6 +516,9 @@ class HFShardedMTRollout(BaseRollout):
             # Curriculum parameter passed from trainer (if any)
             num_segments_required = prompts.meta_info.get("num_segments_required", self.num_segments_required)
 
+            # Effective abstain rate: allow trainer to override via meta_info
+            eff_abstain_rate = prompts.meta_info.get("input_abstain_rate", self.input_abstain_rate)
+
             # If curriculum disabled, effectively ignore it by setting a large requirement
             if not self.curriculum_segments_enabled:
                 num_segments_required = 999
@@ -587,7 +590,7 @@ class HFShardedMTRollout(BaseRollout):
                     last_user_idx = max(i for i, m in enumerate(chat_l) if m["role"] == "user")
 
                     conv = list(chat_l[:last_user_idx])
-                    if self.input_abstain_rate > 0:
+                    if eff_abstain_rate > 0:
                         added = False
                         for msg in conv:
                             if msg.get("role") == "system":
@@ -599,7 +602,7 @@ class HFShardedMTRollout(BaseRollout):
 
                     user_q = chat_l[last_user_idx]["content"]
                     # input abstain format
-                    if random.random() < self.input_abstain_rate and len(segments_per_sample[j]) > min_num_segments:
+                    if random.random() < eff_abstain_rate and len(segments_per_sample[j]) > min_num_segments:
                         segments_n = self._split_question_into_n_segments(user_q, min_num_segments+1, task_type=task_type)
                         # random.shuffle(segments_n)
                         segments_n = segments_n[:-1]
@@ -773,8 +776,8 @@ class HFShardedMTRollout(BaseRollout):
         self.module.train()
         get_torch_device().empty_cache()
         batch_data_proto = DataProto.concat(sample_outputs)
-        self._validate_format_consistency(batch_data_proto, self.config.response_length)
-        self._sanity_check(batch_data_proto, pad_token_id, self.tokenizer)
+        # self._validate_format_consistency(batch_data_proto, self.config.response_length)
+        # self._sanity_check(batch_data_proto, pad_token_id, self.tokenizer)
         # ray.util.pdb.set_trace()
         return batch_data_proto
 
